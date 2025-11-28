@@ -1,0 +1,60 @@
+version: '3.9'
+
+services:
+  # =======================================
+  # API FastAPI
+  # =======================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legal-document-chunking-api
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # Application
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+      PORT: 8000
+
+      # Authentication
+      API_SECRET_KEY: ${API_SECRET_KEY}
+
+      # Mistral AI
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+
+      # Timeouts (seconds)
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-180}
+      PROCESSING_TIMEOUT: ${PROCESSING_TIMEOUT:-120}
+      ENRICHMENT_TIMEOUT: ${ENRICHMENT_TIMEOUT:-30}
+
+      # Rate limiting
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-10}
+
+    volumes:
+      # Mount code for hot-reload in development
+      - ./app:/app/app:ro
+
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level debug
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/live').read()\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
