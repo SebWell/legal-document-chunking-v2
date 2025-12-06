@@ -84,7 +84,7 @@ class DocumentProcessor:
 
     def __init__(self):
         """Initialize the document processor."""
-        self.version = "4.0"  # Version 4.0 for PyMuPDF/PaddleOCR support
+        self.version = "4.1"  # Version 4.1: Added French legal patterns (CHAPITRE, Article, X.X.X)
         self.ocr_engine = "pymupdf-paddleocr"
 
     def _normalize_markdown_headers(self, text: str) -> str:
@@ -362,7 +362,9 @@ class DocumentProcessor:
 
     def chunk_hierarchically(self, text: str, metadata: DocumentMetadata) -> List[Section]:
         """
-        Chunk text into hierarchical sections based on H1/H2/H3 headings.
+        Chunk text into hierarchical sections based on:
+        - Markdown headers (#, ##, ###)
+        - French legal patterns (CHAPITRE, Article, numbered sections)
 
         Args:
             text: Cleaned text
@@ -441,36 +443,81 @@ class DocumentProcessor:
             if not line:
                 continue
 
-            # Check for H1: # Title or 1/ TITLE
+            # === MARKDOWN HEADERS ===
+            # H1: # Title
             h1_match = re.match(r'^#\s+(.+)$', line)
+            # H2: ## Subtitle
+            h2_match = re.match(r'^##\s+(.+)$', line)
+            # H3: ### Sub-subtitle
+            h3_match = re.match(r'^###\s+(.+)$', line)
+
+            # === FRENCH LEGAL PATTERNS ===
+            # H1: CHAPITRE 1, CHAPITRE 2, Chapitre 1 (with optional title after dash/colon)
+            chapitre_match = re.match(r'^(CHAPITRE|Chapitre)\s+(\d+)\s*[-–:]?\s*(.*)$', line, re.IGNORECASE)
+
+            # H2: Article 1.1, ARTICLE 2.3, Article 3.0 (with optional title after dash)
+            article_match = re.match(r'^(Article|ARTICLE)\s+(\d+\.?\d*)\s*[-–:]?\s*(.*)$', line, re.IGNORECASE)
+
+            # H3: 2.3.1, 3.11.2.1 (numbered subsections at start of line with text after)
+            subsection_match = re.match(r'^(\d+\.\d+\.\d+(?:\.\d+)?)\s*[-–:]?\s*(.+)$', line)
+
+            # H1 alternative: 1/ TITRE, 2/ TITRE (existing pattern)
             h1_numbered = re.match(r'^\d+/\s+([A-Z\s]{3,80})$', line)
 
-            if h1_match or h1_numbered:
+            # Process H1-level headers (markdown # or CHAPITRE or numbered)
+            if h1_match or chapitre_match or h1_numbered:
                 headers_found = True
                 save_section()
                 content_buffer = []
-                current_h1 = (h1_match.group(1) if h1_match else h1_numbered.group(1)).strip()[:100]
+
+                if h1_match:
+                    current_h1 = h1_match.group(1).strip()[:100]
+                elif chapitre_match:
+                    # "CHAPITRE 1 - GENERALITES" → "CHAPITRE 1 - GENERALITES"
+                    num = chapitre_match.group(2)
+                    title = chapitre_match.group(3).strip() if chapitre_match.group(3) else ""
+                    current_h1 = f"CHAPITRE {num}" + (f" - {title}" if title else "")
+                    current_h1 = current_h1[:100]
+                else:
+                    current_h1 = h1_numbered.group(1).strip()[:100]
+
                 current_h2 = None
                 current_h3 = None
                 continue
 
-            # Check for H2: ## Subtitle
-            h2_match = re.match(r'^##\s+(.+)$', line)
-            if h2_match:
+            # Process H2-level headers (markdown ## or Article)
+            if h2_match or article_match:
                 headers_found = True
                 save_section()
                 content_buffer = []
-                current_h2 = h2_match.group(1).strip()[:100]
+
+                if h2_match:
+                    current_h2 = h2_match.group(1).strip()[:100]
+                else:
+                    # "Article 1.1 – DESCRIPTION DES TRAVAUX" → "Article 1.1 – DESCRIPTION DES TRAVAUX"
+                    num = article_match.group(2)
+                    title = article_match.group(3).strip() if article_match.group(3) else ""
+                    current_h2 = f"Article {num}" + (f" – {title}" if title else "")
+                    current_h2 = current_h2[:100]
+
                 current_h3 = None
                 continue
 
-            # Check for H3: ### Sub-subtitle
-            h3_match = re.match(r'^###\s+(.+)$', line)
-            if h3_match:
+            # Process H3-level headers (markdown ### or numbered subsections)
+            if h3_match or subsection_match:
                 headers_found = True
                 save_section()
                 content_buffer = []
-                current_h3 = h3_match.group(1).strip()[:100]
+
+                if h3_match:
+                    current_h3 = h3_match.group(1).strip()[:100]
+                else:
+                    # "2.3.1 – Fertilisants" → "2.3.1 – Fertilisants"
+                    num = subsection_match.group(1)
+                    title = subsection_match.group(2).strip() if subsection_match.group(2) else ""
+                    current_h3 = f"{num}" + (f" – {title}" if title else "")
+                    current_h3 = current_h3[:100]
+
                 continue
 
             # Add to content buffer
@@ -482,7 +529,7 @@ class DocumentProcessor:
         # Log chunking results
         logger.info(
             f"Hierarchical chunking complete: {len(sections)} sections created, "
-            f"{rejected_sections} sections rejected (< 25 words)"
+            f"{rejected_sections} sections rejected (< 10 words)"
         )
 
         if not headers_found:
@@ -491,7 +538,7 @@ class DocumentProcessor:
                 f"First 5 lines: {lines[:5]}"
             )
             raise DocumentStructureError(
-                message="Le document ne contient pas la structure hiérarchique attendue (titres Markdown).",
+                message="Le document ne contient pas la structure hiérarchique attendue (titres Markdown ou patterns français).",
                 details={
                     "line_count": len(lines),
                     "first_lines": lines[:5]

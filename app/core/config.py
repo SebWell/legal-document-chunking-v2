@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     # API
-    API_VERSION: str = "4.0.0"
+    API_VERSION: str = "4.1.0"
     API_TITLE: str = "ChantierDoc Document Chunking API (PyMuPDF/PaddleOCR)"
 
     # Authentication
