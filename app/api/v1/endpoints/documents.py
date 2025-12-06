@@ -13,10 +13,6 @@ from fastapi.responses import JSONResponse
 
 from app.models.schemas.document import (
     OCRInput,
-    ChunkingResponse,
-    Chunk,
-    ChunkMetadata,
-    ChunkingStats,
     DocumentMetadata
 )
 from app.core.services.document_processor import DocumentProcessor
@@ -46,7 +42,6 @@ content_enricher = ContentEnricher()
 @router.post(
     "/process-ocr",
     status_code=status.HTTP_200_OK,
-    response_model=ChunkingResponse,
     summary="Process OCR document and return chunks (API Key Required)",
     description="""
     Process OCR text from PyMuPDF or PaddleOCR and return structured chunks
@@ -69,31 +64,26 @@ content_enricher = ContentEnricher()
     }
     ```
 
-    **Output Format (for n8n iteration):**
+    **Output Format (array for n8n direct iteration):**
     ```json
-    {
-      "success": true,
-      "documentId": "doc-123",
-      "chunks": [
-        {
-          "id": "chunk-001",
-          "documentId": "doc-123",
-          "userId": "user-uuid",
-          "projectId": "project-uuid",
-          "content": "Raw chunk content...",
-          "enrichedContent": "Enriched content with context...",
-          "metadata": {...}
-        }
-      ],
-      "stats": {...},
-      "metadata": {...}
-    }
+    [
+      {
+        "chunk_id": "chunk-doc-123-001",
+        "document_id": "doc-123",
+        "user_id": "user-uuid",
+        "project_id": "project-uuid",
+        "content": "Raw chunk content...",
+        "enriched_content": "Enriched content with context...",
+        "metadata": {...}
+      },
+      ...
+    ]
     ```
 
     **n8n Usage:**
     1. Call this endpoint with OCR text
-    2. Use "Split In Batches" node on `chunks` array
-    3. Insert each chunk into Supabase `vector_documents` table
+    2. Each chunk is a separate item - no Split needed
+    3. Insert each chunk into Supabase `vector_documents` table using $json.chunk_id, $json.content, etc.
 
     **Minimum Requirements:**
     - Valid API Key in X-API-Key header
@@ -101,16 +91,16 @@ content_enricher = ContentEnricher()
     - Project ID required
     - OCR text must be non-empty (>50 chars)
     """,
-    response_description="Chunked document ready for Supabase insertion"
+    response_description="Array of chunks ready for Supabase insertion"
 )
 @limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
 async def process_ocr_document(
     request: Request,
     body: Dict[str, Any] = Body(...),
     _: None = Depends(verify_api_key)
-) -> ChunkingResponse:
+) -> JSONResponse:
     """
-    Process OCR document and return chunks for n8n/Supabase.
+    Process OCR document and return chunks as array for n8n/Supabase.
 
     Args:
         request: Starlette Request object (required by slowapi)
@@ -118,7 +108,7 @@ async def process_ocr_document(
         _: API key validation (verified by verify_api_key dependency)
 
     Returns:
-        ChunkingResponse with chunks ready for Supabase insertion
+        JSONResponse with array of chunks ready for direct Supabase insertion
 
     Raises:
         HTTPException 400: Invalid input (empty text, missing IDs)
@@ -180,75 +170,58 @@ async def process_ocr_document(
             outline=result.documentOutline
         )
 
-        # Convert sections to chunks for n8n/Supabase
-        chunks: List[Chunk] = []
+        # Build flat array of chunks for N8N direct iteration
+        # Each chunk is formatted for direct insertion into vector_documents table
+        chunks_for_supabase: List[Dict[str, Any]] = []
         total_words = 0
 
         for idx, section in enumerate(result.sections):
             chunk_id = f"chunk-{result.documentId}-{idx:03d}"
 
-            # Build chunk metadata
-            chunk_metadata = ChunkMetadata(
-                chunkIndex=idx,
-                h1=section.h1,
-                h2=section.h2,
-                h3=section.h3,
-                title=section.title,
-                type=section.type,
-                wordCount=section.wordCount,
-                keywords=section.keywords,
-                breadcrumb=section.breadcrumb,
-                sectionPosition=section.sectionPosition,
-                documentType=section.documentType,
-                documentTitle=section.documentTitle,
-                documentReference=section.documentReference,
-                ocrSource=ocr_source,
-                ocrConfidence=ocr_confidence,
-                parentSection=section.parentSection,
-                siblingSections=section.siblingSections
-            )
+            # Build chunk with snake_case keys matching Supabase columns
+            chunk_for_db = {
+                "chunk_id": chunk_id,
+                "document_id": result.documentId,
+                "user_id": user_id,
+                "project_id": project_id,
+                "content": section.content,
+                "enriched_content": enriched_contents[idx] if idx < len(enriched_contents) else section.content,
+                "metadata": {
+                    "chunkIndex": idx,
+                    "h1": section.h1,
+                    "h2": section.h2,
+                    "h3": section.h3,
+                    "title": section.title,
+                    "type": section.type,
+                    "wordCount": section.wordCount,
+                    "keywords": section.keywords,
+                    "breadcrumb": section.breadcrumb,
+                    "sectionPosition": section.sectionPosition,
+                    "documentType": section.documentType,
+                    "documentTitle": section.documentTitle,
+                    "documentReference": section.documentReference,
+                    "ocrSource": ocr_source,
+                    "ocrConfidence": ocr_confidence,
+                    "parentSection": section.parentSection,
+                    "siblingSections": section.siblingSections
+                }
+            }
 
-            # Build chunk with enriched content
-            chunk = Chunk(
-                id=chunk_id,
-                documentId=result.documentId,
-                userId=user_id,
-                projectId=project_id,
-                content=section.content,
-                enrichedContent=enriched_contents[idx] if idx < len(enriched_contents) else section.content,
-                metadata=chunk_metadata
-            )
-
-            chunks.append(chunk)
+            chunks_for_supabase.append(chunk_for_db)
             total_words += section.wordCount
 
         # Calculate processing time
         processing_time_ms = int((time.time() - start_time) * 1000)
 
-        # Build stats
-        stats = ChunkingStats(
-            totalChunks=len(chunks),
-            totalWords=total_words,
-            avgWordsPerChunk=total_words // len(chunks) if chunks else 0,
-            processingTimeMs=processing_time_ms,
-            ocrSource=ocr_source,
-            ocrConfidence=ocr_confidence
-        )
-
         # Log success
         logger.info(
             f"Document chunked successfully | ID: {result.documentId} | "
-            f"Chunks: {len(chunks)} | Words: {total_words} | "
+            f"Chunks: {len(chunks_for_supabase)} | Words: {total_words} | "
             f"Time: {processing_time_ms}ms"
         )
 
-        return ChunkingResponse(
-            success=True,
-            documentId=result.documentId,
-            chunks=chunks,
-            stats=stats,
-            metadata=result.metadata
-        )
+        # Return array directly for N8N to iterate over each chunk as separate item
+        return JSONResponse(content=chunks_for_supabase)
 
     except HTTPException:
         # Re-raise HTTP exceptions
