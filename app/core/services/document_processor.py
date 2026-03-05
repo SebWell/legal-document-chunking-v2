@@ -360,11 +360,86 @@ class DocumentProcessor:
 
         return None
 
+    # Maximum chunk size in characters before forcing a split
+    MAX_CHUNK_CHARS = 4000
+
+    def _split_large_section(
+        self,
+        content: str,
+        metadata: DocumentMetadata,
+        h1: Optional[str],
+        h2: Optional[str],
+        h3: Optional[str],
+    ) -> List[Section]:
+        """
+        Split a section that exceeds MAX_CHUNK_CHARS into smaller chunks
+        by splitting on paragraph boundaries.
+        """
+        parts = []
+        paragraphs = content.split('\n\n')
+        current = ''
+        part_index = 0
+
+        for para in paragraphs:
+            if current and len(current) + len(para) > self.MAX_CHUNK_CHARS:
+                parts.append((current.strip(), part_index))
+                current = ''
+                part_index += 1
+            current += para + '\n\n'
+
+        if current.strip():
+            parts.append((current.strip(), part_index))
+
+        sections = []
+        for part_content, idx in parts:
+            word_count = len(part_content.split())
+            if word_count < 10:
+                continue
+
+            title_parts = []
+            if h1:
+                title_parts.append(h1)
+            if h2:
+                title_parts.append(h2)
+            if h3:
+                title_parts.append(h3)
+            suffix = f" (suite {idx})" if idx > 0 else ""
+            title = (' > '.join(title_parts) if title_parts else 'Section sans titre') + suffix
+
+            sections.append(Section(
+                documentType=metadata.documentType,
+                documentTitle=metadata.documentTitle,
+                documentReference=metadata.reference,
+                h1=h1,
+                h2=h2,
+                h3=h3 + suffix if h3 else (h2 + suffix if h2 and idx > 0 else h3),
+                title=title,
+                type=self._classify_section_type(part_content),
+                content=part_content,
+                wordCount=word_count,
+                keywords=self._extract_keywords(part_content),
+                sectionPosition=1,
+                breadcrumb="",
+                parentSection=None,
+                siblingSections=[]
+            ))
+
+        return sections
+
     def chunk_hierarchically(self, text: str, metadata: DocumentMetadata) -> List[Section]:
         """
         Chunk text into hierarchical sections based on:
-        - Markdown headers (#, ##, ###)
+        - Markdown headers (#, ##, ###, ####, #####, ######)
         - French legal patterns (CHAPITRE, Article, numbered sections)
+
+        PyMuPDF4LLM often assigns unexpected header levels (e.g. H4 for TITRE,
+        H6 for CHAPITRE in PLU documents). We normalize all markdown header
+        levels into H1/H2/H3 buckets to ensure proper chunking.
+
+        Mapping:
+        - # and #### → H1 (top-level sections / TITRE)
+        - ## and ##### → H2 (chapters / ARTICLE)
+        - ### and ###### → H3 (sub-sections)
 
         Args:
             text: Cleaned text
@@ -417,6 +492,14 @@ class DocumentProcessor:
             # Extract keywords
             keywords = self._extract_keywords(content)
 
+            # If section is too large, split it
+            if len(content) > self.MAX_CHUNK_CHARS:
+                sub_sections = self._split_large_section(
+                    content, metadata, current_h1, current_h2, current_h3
+                )
+                sections.extend(sub_sections)
+                return
+
             section = Section(
                 documentType=metadata.documentType,
                 documentTitle=metadata.documentTitle,
@@ -443,20 +526,18 @@ class DocumentProcessor:
             if not line:
                 continue
 
-            # === MARKDOWN HEADERS ===
-            # H1: # Title
-            h1_match = re.match(r'^#\s+(.+)$', line)
-            # H2: ## Subtitle
-            h2_match = re.match(r'^##\s+(.+)$', line)
-            # H3: ### Sub-subtitle
-            h3_match = re.match(r'^###\s+(.+)$', line)
+            # === MARKDOWN HEADERS (all levels) ===
+            # Detect any markdown header and extract level + title
+            md_header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
 
             # === FRENCH LEGAL PATTERNS ===
             # H1: CHAPITRE 1, CHAPITRE 2, Chapitre 1 (with optional title after dash/colon)
-            chapitre_match = re.match(r'^(CHAPITRE|Chapitre)\s+(\d+)\s*[-–:]?\s*(.*)$', line, re.IGNORECASE)
+            # Also match "CHAPITRE I –" with Roman numerals or text after dash
+            chapitre_match = re.match(r'^(?:\*{0,2})(CHAPITRE|Chapitre)\s+([IVXLCDM\d]+)\s*[-–:]?\s*(.*?)(?:\*{0,2})$', line, re.IGNORECASE)
 
             # H2: Article 1.1, ARTICLE 2.3, Article 3.0 (with optional title after dash)
-            article_match = re.match(r'^(Article|ARTICLE)\s+(\d+\.?\d*)\s*[-–:]?\s*(.*)$', line, re.IGNORECASE)
+            # Also match "ARTICLE Ua 1" or "ARTICLE N 2" (PLU zone articles)
+            article_match = re.match(r'^(?:\*{0,2})(Article|ARTICLE)\s+([A-Za-z0-9\s]+?\.?\d*)\s*[-–:]?\s*(.*?)(?:\*{0,2})$', line, re.IGNORECASE)
 
             # H3: 2.3.1, 3.11.2.1 (numbered subsections at start of line with text after)
             subsection_match = re.match(r'^(\d+\.\d+\.\d+(?:\.\d+)?)\s*[-–:]?\s*(.+)$', line)
@@ -464,59 +545,79 @@ class DocumentProcessor:
             # H1 alternative: 1/ TITRE, 2/ TITRE (existing pattern)
             h1_numbered = re.match(r'^\d+/\s+([A-Z\s]{3,80})$', line)
 
-            # Process H1-level headers (markdown # or CHAPITRE or numbered)
-            if h1_match or chapitre_match or h1_numbered:
+            # Determine effective header level from markdown headers
+            # Normalize H4→H1, H5→H2, H6→H3 for documents where PyMuPDF4LLM
+            # assigns deep header levels (common in PLU/legal documents)
+            effective_level = None
+            header_title = None
+
+            if md_header_match:
+                raw_level = len(md_header_match.group(1))
+                header_title = md_header_match.group(2).strip()
+                # Remove bold markers (**text**)
+                header_title = re.sub(r'\*{1,2}', '', header_title).strip()
+                header_title = header_title[:100]
+
+                # Map: 1,4 → H1 | 2,5 → H2 | 3,6 → H3
+                if raw_level in (1, 4):
+                    effective_level = 1
+                elif raw_level in (2, 5):
+                    effective_level = 2
+                else:  # 3 or 6
+                    effective_level = 3
+
+            # Process H1-level headers (markdown H1/H4 or CHAPITRE or numbered)
+            if effective_level == 1 or chapitre_match or h1_numbered:
                 headers_found = True
                 save_section()
                 content_buffer = []
 
-                if h1_match:
-                    current_h1 = h1_match.group(1).strip()[:100]
-                elif chapitre_match:
-                    # "CHAPITRE 1 - GENERALITES" → "CHAPITRE 1 - GENERALITES"
+                if chapitre_match:
                     num = chapitre_match.group(2)
                     title = chapitre_match.group(3).strip() if chapitre_match.group(3) else ""
+                    title = re.sub(r'\*{1,2}', '', title).strip()
                     current_h1 = f"CHAPITRE {num}" + (f" - {title}" if title else "")
                     current_h1 = current_h1[:100]
-                else:
+                elif h1_numbered:
                     current_h1 = h1_numbered.group(1).strip()[:100]
+                else:
+                    current_h1 = header_title
 
                 current_h2 = None
                 current_h3 = None
                 continue
 
-            # Process H2-level headers (markdown ## or Article)
-            if h2_match or article_match:
+            # Process H2-level headers (markdown H2/H5 or Article)
+            if effective_level == 2 or article_match:
                 headers_found = True
                 save_section()
                 content_buffer = []
 
-                if h2_match:
-                    current_h2 = h2_match.group(1).strip()[:100]
-                else:
-                    # "Article 1.1 – DESCRIPTION DES TRAVAUX" → "Article 1.1 – DESCRIPTION DES TRAVAUX"
-                    num = article_match.group(2)
+                if article_match:
+                    num = article_match.group(2).strip()
                     title = article_match.group(3).strip() if article_match.group(3) else ""
+                    title = re.sub(r'\*{1,2}', '', title).strip()
                     current_h2 = f"Article {num}" + (f" – {title}" if title else "")
                     current_h2 = current_h2[:100]
+                else:
+                    current_h2 = header_title
 
                 current_h3 = None
                 continue
 
-            # Process H3-level headers (markdown ### or numbered subsections)
-            if h3_match or subsection_match:
+            # Process H3-level headers (markdown H3/H6 or numbered subsections)
+            if effective_level == 3 or subsection_match:
                 headers_found = True
                 save_section()
                 content_buffer = []
 
-                if h3_match:
-                    current_h3 = h3_match.group(1).strip()[:100]
-                else:
-                    # "2.3.1 – Fertilisants" → "2.3.1 – Fertilisants"
+                if subsection_match:
                     num = subsection_match.group(1)
                     title = subsection_match.group(2).strip() if subsection_match.group(2) else ""
                     current_h3 = f"{num}" + (f" – {title}" if title else "")
                     current_h3 = current_h3[:100]
+                else:
+                    current_h3 = header_title
 
                 continue
 
