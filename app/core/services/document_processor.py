@@ -141,12 +141,17 @@ class DocumentProcessor:
         """
         cleaned = text
 
+        # Remove PyMuPDF4LLM picture placeholders BEFORE HTML cleaning
+        # Format: **==> picture [W x H] intentionally omitted <==**
+        # Must be done first because <==** triggers the HTML regex across lines
+        cleaned = re.sub(r'\*?\*?=*>?\s*picture\s*\[[^\]]*\]\s*intentionally\s+omitted\s*<?=*\*?\*?', '', cleaned)
+
         # Replace <br> with newline to preserve line structure for markdown headers
         # IMPORTANT: Use \n instead of space to keep headers on separate lines
         cleaned = re.sub(r'<br\s*/?>', '\n', cleaned)  # <br> or <br/> → newline
 
-        # Remove other HTML tags (but not line breaks)
-        cleaned = re.sub(r'<(?!br)[^>]+>', '', cleaned)  # Any HTML tag except br
+        # Remove HTML tags: only match proper tags starting with a letter (not <== or <= operators)
+        cleaned = re.sub(r'<(?!br)/?[a-zA-Z][^>]*>', '', cleaned)
 
         # Remove markdown image references
         cleaned = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', '', cleaned)  # ![alt](image.jpg)
@@ -646,7 +651,100 @@ class DocumentProcessor:
                 }
             )
 
+        # Consolidate small adjacent sections when there are too many headers
+        # PyMuPDF4LLM can produce excessive ## headers (every bold line becomes H2),
+        # creating hundreds of micro-sections. Merge adjacent small sections to produce
+        # meaningful chunks while preserving document structure.
+        if len(sections) > 50:
+            sections = self._consolidate_small_sections(sections, metadata)
+
         return sections
+
+    def _consolidate_small_sections(
+        self,
+        sections: List[Section],
+        metadata: DocumentMetadata,
+        min_words: int = 50,
+        max_words: int = 1500
+    ) -> List[Section]:
+        """
+        Merge adjacent small sections into larger ones.
+
+        When PyMuPDF4LLM produces excessive H2 headers (bold lines → ##),
+        many sections end up with < 50 words. This method merges them with
+        the next section at the same hierarchy level to produce meaningful chunks.
+
+        Args:
+            sections: List of sections from hierarchical chunking
+            metadata: Document metadata
+            min_words: Sections below this threshold get merged with the next
+            max_words: Maximum word count for a merged section
+
+        Returns:
+            Consolidated list of sections
+        """
+        if not sections:
+            return sections
+
+        consolidated = []
+        i = 0
+
+        while i < len(sections):
+            current = sections[i]
+
+            # If section is large enough, keep as-is
+            if current.wordCount >= min_words:
+                consolidated.append(current)
+                i += 1
+                continue
+
+            # Small section: try to merge with following small sections at same H1 level
+            merged_content_parts = [current.content]
+            merged_word_count = current.wordCount
+            merged_end_char = current.endChar if hasattr(current, 'endChar') else 0
+            j = i + 1
+
+            while j < len(sections):
+                next_sec = sections[j]
+                # Stop merging if we'd exceed max_words
+                if merged_word_count + next_sec.wordCount > max_words:
+                    break
+                # Stop merging if H1 changes (different chapter)
+                if next_sec.h1 != current.h1:
+                    break
+                # Merge
+                merged_content_parts.append(next_sec.content)
+                merged_word_count += next_sec.wordCount
+                if hasattr(next_sec, 'endChar'):
+                    merged_end_char = next_sec.endChar
+                j += 1
+                # Stop if merged section is now large enough
+                if merged_word_count >= min_words:
+                    break
+
+            if j > i + 1:
+                # Build merged section
+                merged_content = '\n\n'.join(merged_content_parts)
+                section_dict = current.model_dump()
+                section_dict.update({
+                    'content': merged_content,
+                    'wordCount': merged_word_count,
+                    'keywords': self._extract_keywords(merged_content),
+                    'type': self._classify_section_type(merged_content),
+                })
+                if 'endChar' in section_dict:
+                    section_dict['endChar'] = merged_end_char
+                consolidated.append(Section(**section_dict))
+            else:
+                consolidated.append(current)
+
+            i = j
+
+        logger.info(
+            f"Consolidated {len(sections)} sections into {len(consolidated)} "
+            f"(merged {len(sections) - len(consolidated)} small sections)"
+        )
+        return consolidated
 
     def _classify_section_type(self, content: str) -> str:
         """
