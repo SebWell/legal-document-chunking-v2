@@ -168,6 +168,122 @@ class DocumentProcessor:
 
         return cleaned.strip()
 
+    def clean_html_entities(self, text: str) -> str:
+        """
+        Decode HTML entities: &amp; → &, &nbsp; → space, &#8212; → —, etc.
+        """
+        import html as html_module
+        return html_module.unescape(text)
+
+    def clean_markdown_tables(self, text: str) -> str:
+        """
+        Convert markdown tables to natural language text.
+        Keeps the data but removes the pipe/separator noise.
+
+        | Header1 | Header2 |       →  Header1 : val1. Header2 : val2.
+        | --- | --- |
+        | val1 | val2 |
+        """
+        lines = text.split('\n')
+        result = []
+        table_block: list[str] = []
+        in_table = False
+
+        def flush_table():
+            if not table_block:
+                return
+            # Extract headers from first row
+            headers: list[str] = []
+            data_rows: list[list[str]] = []
+
+            for row in table_block:
+                cells = [c.strip() for c in row.strip().strip('|').split('|')]
+                cells = [c for c in cells if c]
+                # Skip separator rows (all cells are --- or similar)
+                if all(re.match(r'^-+:?$|^:?-+:?$|^:?-+$', c) for c in cells):
+                    continue
+                if not headers:
+                    headers = cells
+                else:
+                    data_rows.append(cells)
+
+            if not headers:
+                return
+
+            # If no data rows, just output headers as a list
+            if not data_rows:
+                result.append(', '.join(headers) + '.')
+                return
+
+            # Convert each data row to natural text
+            for row in data_rows:
+                parts = []
+                for i, val in enumerate(row):
+                    if not val or val == '-':
+                        continue
+                    if i < len(headers) and headers[i] and headers[i] != val:
+                        parts.append(f"{headers[i]} : {val}")
+                    else:
+                        parts.append(val)
+                if parts:
+                    result.append('. '.join(parts) + '.')
+
+        for line in lines:
+            stripped = line.strip()
+            # Detect table lines: starts and ends with | or has multiple |
+            is_table_line = (stripped.startswith('|') and stripped.endswith('|')) or stripped.count('|') >= 2
+
+            if is_table_line:
+                if not in_table:
+                    in_table = True
+                    table_block = []
+                table_block.append(stripped)
+            else:
+                if in_table:
+                    flush_table()
+                    table_block = []
+                    in_table = False
+                result.append(line)
+
+        # Flush last table block
+        if in_table:
+            flush_table()
+
+        return '\n'.join(result)
+
+    def remove_repeated_headers(self, text: str) -> str:
+        """
+        Remove lines that appear more than 3 times in the text (page headers/footers).
+        """
+        lines = text.split('\n')
+        # Count occurrences of each non-empty line
+        line_counts: Counter = Counter()
+        for line in lines:
+            stripped = line.strip()
+            if len(stripped) > 5:  # Ignore very short lines
+                line_counts[stripped] += 1
+
+        # Find lines repeated more than 3 times
+        repeated = {line for line, count in line_counts.items() if count > 3}
+
+        if repeated:
+            logger.info(f"Removing {len(repeated)} repeated header/footer lines")
+            lines = [line for line in lines if line.strip() not in repeated]
+
+        return '\n'.join(lines)
+
+    def clean_noise(self, text: str) -> str:
+        """
+        Remove control characters, normalize whitespace.
+        """
+        # Remove control characters except newline and tab
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+        # Normalize multiple spaces (preserve newlines)
+        cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+        # Max 2 consecutive empty lines
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned.strip()
+
     def clean_latex(self, text: str) -> str:
         """
         Remove LaTeX markers from OCR text.
@@ -489,6 +605,14 @@ class DocumentProcessor:
 
             # Only save sections with at least 10 words (reduced from 25 for legal documents)
             # Legal documents often have short but important sections like "D'UNE PART", clauses, etc.
+            # Skip table of contents / sommaire (no RAG value)
+            section_title = (current_h1 or '').upper()
+            if section_title in ('SOMMAIRE', 'TABLE DES MATIERES', 'TABLE DES MATIÈRES',
+                                 'TABLE OF CONTENTS', 'INDEX', 'CONTENTS'):
+                rejected_sections += 1
+                logger.debug(f"Rejected sommaire section: {section_title}")
+                return
+
             if word_count < 10:
                 rejected_sections += 1
                 logger.debug(f"Rejected section (only {word_count} words): {current_h1 or current_h2 or current_h3 or 'Unknown'}")
@@ -1052,19 +1176,27 @@ class DocumentProcessor:
 
             # Step 1: Clean HTML markers (br, img, etc.)
             logger.info("Cleaning HTML markers from OCR text")
-            logger.info(f"BEFORE HTML clean: newlines={ocr_text.count(chr(10))}, len={len(ocr_text)}, text[:100]={repr(ocr_text[:100])}")
             cleaned_text = self.clean_html_markers(ocr_text)
-            logger.info(f"AFTER HTML clean: newlines={cleaned_text.count(chr(10))}, len={len(cleaned_text)}, text[:100]={repr(cleaned_text[:100])}")
 
-            # Step 1b: Fix markdown headers on same line (e.g., "# Title ## Subtitle" → separate lines)
-            logger.info("Normalizing markdown headers")
+            # Step 1b: Decode HTML entities (&amp; → &, &nbsp; → space)
+            cleaned_text = self.clean_html_entities(cleaned_text)
+
+            # Step 1c: Convert markdown tables to natural language text
+            cleaned_text = self.clean_markdown_tables(cleaned_text)
+
+            # Step 1d: Remove repeated headers/footers (page noise)
+            cleaned_text = self.remove_repeated_headers(cleaned_text)
+
+            # Step 1e: Fix markdown headers on same line
             cleaned_text = self._normalize_markdown_headers(cleaned_text)
-            logger.info(f"AFTER header normalize: newlines={cleaned_text.count(chr(10))}, len={len(cleaned_text)}, text[:100]={repr(cleaned_text[:100])}")
 
             # Step 2: Clean LaTeX markers
-            logger.info("Cleaning LaTeX markers from OCR text")
             cleaned_text = self.clean_latex(cleaned_text)
-            logger.info(f"AFTER LaTeX clean: newlines={cleaned_text.count(chr(10))}, lines={len(cleaned_text.split(chr(10)))}")
+
+            # Step 2b: Clean noise (control chars, whitespace)
+            cleaned_text = self.clean_noise(cleaned_text)
+
+            logger.info(f"Text cleaned: {len(ocr_text)} → {len(cleaned_text)} chars ({len(ocr_text) - len(cleaned_text)} removed)")
 
             # Step 3: Extract metadata
             logger.info("Extracting document metadata")
