@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = '["http://localhost:3000"]'
     ALLOWED_HOSTS: str = '["localhost"]'
 
+    # Chunking
+    MAX_CHUNK_TOKENS: int = 512           # Max tokens per chunk (content only)
+    MAX_CHUNK_CHARS: int = 1500           # Max characters per chunk (content only)
+    TOKEN_ESTIMATION_RATIO: float = 3.5   # Average chars per token for French text
+
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 10
 

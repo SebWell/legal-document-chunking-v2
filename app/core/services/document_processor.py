@@ -30,6 +30,7 @@ from app.models.schemas.document import (
     DocumentOutline
 )
 from app.core.exceptions import DocumentStructureError
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -365,8 +366,17 @@ class DocumentProcessor:
 
         return None
 
-    # Maximum chunk size in characters before forcing a split
-    MAX_CHUNK_CHARS = 4000
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count from text length using configured ratio."""
+        settings = get_settings()
+        return int(len(text) / settings.TOKEN_ESTIMATION_RATIO)
+
+    def _should_split(self, content: str) -> bool:
+        """Check if content exceeds max chunk size (chars or tokens)."""
+        settings = get_settings()
+        return (len(content) > settings.MAX_CHUNK_CHARS or
+                self._estimate_tokens(content) > settings.MAX_CHUNK_TOKENS)
 
     def _split_large_section(
         self,
@@ -377,16 +387,19 @@ class DocumentProcessor:
         h3: Optional[str],
     ) -> List[Section]:
         """
-        Split a section that exceeds MAX_CHUNK_CHARS into smaller chunks
-        by splitting on paragraph boundaries.
+        Split a section that exceeds MAX_CHUNK_CHARS or MAX_CHUNK_TOKENS
+        into smaller chunks by splitting on paragraph boundaries.
         """
+        settings = get_settings()
+        max_chars = settings.MAX_CHUNK_CHARS
         parts = []
         paragraphs = content.split('\n\n')
         current = ''
         part_index = 0
 
         for para in paragraphs:
-            if current and len(current) + len(para) > self.MAX_CHUNK_CHARS:
+            candidate = current + para + '\n\n'
+            if current and (len(candidate) > max_chars or self._estimate_tokens(candidate) > settings.MAX_CHUNK_TOKENS):
                 parts.append((current.strip(), part_index))
                 current = ''
                 part_index += 1
@@ -422,6 +435,7 @@ class DocumentProcessor:
                 type=self._classify_section_type(part_content),
                 content=part_content,
                 wordCount=word_count,
+                tokenCount=self._estimate_tokens(part_content),
                 keywords=self._extract_keywords(part_content),
                 sectionPosition=1,
                 breadcrumb="",
@@ -498,7 +512,7 @@ class DocumentProcessor:
             keywords = self._extract_keywords(content)
 
             # If section is too large, split it
-            if len(content) > self.MAX_CHUNK_CHARS:
+            if self._should_split(content):
                 sub_sections = self._split_large_section(
                     content, metadata, current_h1, current_h2, current_h3
                 )
@@ -516,6 +530,7 @@ class DocumentProcessor:
                 type=section_type,
                 content=content,
                 wordCount=word_count,
+                tokenCount=self._estimate_tokens(content),
                 keywords=keywords,
                 # Temporary values - will be enriched later
                 sectionPosition=1,  # Placeholder, will be updated by enrich_sections_with_outline_context()
@@ -665,7 +680,7 @@ class DocumentProcessor:
         sections: List[Section],
         metadata: DocumentMetadata,
         min_words: int = 50,
-        max_words: int = 1500
+        max_words: int = 400
     ) -> List[Section]:
         """
         Merge adjacent small sections into larger ones.
@@ -983,12 +998,16 @@ class DocumentProcessor:
         """
         total_sections = len(sections)
         total_words = sum(s.wordCount for s in sections)
+        total_tokens = sum(s.tokenCount for s in sections)
         avg_words = round(total_words / total_sections) if total_sections > 0 else 0
+        avg_tokens = round(total_tokens / total_sections) if total_sections > 0 else 0
 
         return ProcessingStats(
             totalSections=total_sections,
             totalWords=total_words,
+            totalTokens=total_tokens,
             avgWordsPerSection=avg_words,
+            avgTokensPerSection=avg_tokens,
             processingDate=datetime.now(timezone.utc).isoformat(),
             ocrEngine=ocr_source,
             version=self.version

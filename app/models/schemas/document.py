@@ -144,6 +144,8 @@ class Section(BaseModel):
     type: str = Field(..., description="Semantic section type")
     content: str = Field(..., description="Section content")
     wordCount: int = Field(..., description="Number of words in section")
+    tokenCount: int = Field(0, description="Estimated token count (content only)")
+    enrichedTokenCount: int = Field(0, description="Estimated token count (enriched content)")
     keywords: List[str] = Field(..., description="Top 5 keywords from content")
 
     # NEW: Outline context fields
@@ -180,7 +182,9 @@ class ProcessingStats(BaseModel):
 
     totalSections: int = Field(..., description="Total number of sections created")
     totalWords: int = Field(..., description="Total word count across all sections")
+    totalTokens: int = Field(0, description="Total estimated token count across all sections")
     avgWordsPerSection: int = Field(..., description="Average words per section")
+    avgTokensPerSection: int = Field(0, description="Average estimated tokens per section")
     processingDate: str = Field(..., description="ISO 8601 UTC timestamp")
     ocrEngine: str = Field(..., description="OCR engine used")
     version: str = Field(..., description="Processing version")

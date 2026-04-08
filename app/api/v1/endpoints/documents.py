@@ -174,9 +174,15 @@ async def process_ocr_document(
         # Each chunk is formatted for direct insertion into vector_documents table
         chunks_for_supabase: List[Dict[str, Any]] = []
         total_words = 0
+        total_tokens = 0
+
+        # Token estimation helper
+        token_ratio = 3.5  # chars per token for French
 
         for idx, section in enumerate(result.sections):
             chunk_id = f"chunk-{result.documentId}-{idx:03d}"
+            enriched = enriched_contents[idx] if idx < len(enriched_contents) else section.content
+            enriched_token_count = int(len(enriched) / token_ratio)
 
             # Build chunk with snake_case keys matching Supabase columns
             chunk_for_db = {
@@ -185,7 +191,7 @@ async def process_ocr_document(
                 "user_id": user_id,
                 "project_id": project_id,
                 "content": section.content,
-                "enriched_content": enriched_contents[idx] if idx < len(enriched_contents) else section.content,
+                "enriched_content": enriched,
                 "metadata": {
                     "chunkIndex": idx,
                     "h1": section.h1,
@@ -194,6 +200,8 @@ async def process_ocr_document(
                     "title": section.title,
                     "type": section.type,
                     "wordCount": section.wordCount,
+                    "tokenCount": section.tokenCount,
+                    "enrichedTokenCount": enriched_token_count,
                     "keywords": section.keywords,
                     "breadcrumb": section.breadcrumb,
                     "sectionPosition": section.sectionPosition,
@@ -209,14 +217,17 @@ async def process_ocr_document(
 
             chunks_for_supabase.append(chunk_for_db)
             total_words += section.wordCount
+            total_tokens += section.tokenCount
 
         # Calculate processing time
         processing_time_ms = int((time.time() - start_time) * 1000)
 
         # Log success
+        avg_tokens = total_tokens // max(len(chunks_for_supabase), 1)
         logger.info(
             f"Document chunked successfully | ID: {result.documentId} | "
             f"Chunks: {len(chunks_for_supabase)} | Words: {total_words} | "
+            f"Tokens: {total_tokens} (avg {avg_tokens}/chunk) | "
             f"Time: {processing_time_ms}ms"
         )
 

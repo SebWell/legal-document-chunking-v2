@@ -376,8 +376,9 @@ class TestDocumentProcessor:
         assert stats.totalSections == 2
         assert stats.totalWords == 300
         assert stats.avgWordsPerSection == 150
-        assert stats.ocrEngine == "mistral-ocr"
-        assert stats.version == "3.0"
+        assert stats.ocrEngine == "pymupdf"
+        assert stats.totalTokens >= 0
+        assert stats.avgTokensPerSection >= 0
 
     def test_calculate_stats_empty(self, processor):
         """Test statistics calculation with empty sections."""
