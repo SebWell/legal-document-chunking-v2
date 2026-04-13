@@ -6,8 +6,9 @@ from PyMuPDF/PaddleOCR and returning structured chunks for n8n/Supabase.
 """
 
 import logging
+import re
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, status, Body, Depends, Request
 from fastapi.responses import JSONResponse
 
@@ -253,6 +254,243 @@ async def process_ocr_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process document: {str(e)}"
         )
+
+
+def _build_chunks_response(
+    result,
+    user_id: str,
+    project_id: str,
+    ocr_source: str,
+    ocr_confidence=None,
+    page_numbers: Optional[Dict[int, int]] = None,
+    confidence_scores: Optional[Dict[int, float]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Shared helper: turn ProcessedDocument + enriched contents into the flat
+    chunk array expected by the Cloudflare Worker.  No embeddings — the Worker
+    generates them via Workers AI bge-m3.
+    """
+    enriched_contents = content_enricher.enrich_all_sections(
+        sections=result.sections,
+        metadata=result.metadata,
+        outline=result.documentOutline,
+    )
+    token_ratio = 3.5
+    chunks: List[Dict[str, Any]] = []
+    for idx, section in enumerate(result.sections):
+        chunk_id = f"chunk-{result.documentId}-{idx:03d}"
+        enriched = enriched_contents[idx] if idx < len(enriched_contents) else section.content
+        enriched_token_count = int(len(enriched) / token_ratio)
+
+        meta: Dict[str, Any] = {
+            "chunkIndex": idx,
+            "h1": section.h1,
+            "h2": section.h2,
+            "h3": section.h3,
+            "title": section.title,
+            "type": section.type,
+            "wordCount": section.wordCount,
+            "tokenCount": section.tokenCount,
+            "enrichedTokenCount": enriched_token_count,
+            "keywords": section.keywords,
+            "breadcrumb": section.breadcrumb,
+            "sectionPosition": section.sectionPosition,
+            "documentType": section.documentType,
+            "documentTitle": section.documentTitle,
+            "documentReference": section.documentReference,
+            "ocrSource": ocr_source,
+            "ocrConfidence": ocr_confidence,
+            "parentSection": section.parentSection,
+            "siblingSections": section.siblingSections,
+            "source": ocr_source,
+        }
+        if page_numbers and idx in page_numbers:
+            meta["page_number"] = page_numbers[idx]
+        if confidence_scores and idx in confidence_scores:
+            meta["confidence"] = confidence_scores[idx]
+
+        chunks.append({
+            "chunk_id": chunk_id,
+            "document_id": result.documentId,
+            "user_id": user_id,
+            "project_id": project_id,
+            "content": section.content,
+            "enriched_content": enriched,
+            "metadata": meta,
+        })
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# NEW: /process-pymupdf  — called by Cloudflare Worker (PyMuPDF source)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/process-pymupdf",
+    status_code=status.HTTP_200_OK,
+    summary="Process PyMuPDF markdown and return chunks (no embeddings)",
+)
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def process_pymupdf(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    _: None = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Accept raw markdown from PyMuPDF, chunk it, and return structured chunks.
+    Embeddings are NOT included — the Cloudflare Worker generates them via
+    Workers AI bge-m3.
+
+    Input: { text, document_id, user_id, project_id, metadata: { document_name, mop_phase, module } }
+    Output: ChunkResult[] (same schema as /process-ocr but without embedding field)
+    """
+    start_time = time.time()
+    try:
+        text = body.get("text", "")
+        document_id = body.get("document_id")
+        user_id = body.get("user_id", "")
+        project_id = body.get("project_id", "")
+        meta = body.get("metadata", {})
+
+        if not text or len(text) < 50:
+            raise HTTPException(status_code=400, detail=f"text too short ({len(text)} chars, min 50)")
+        if not user_id or not project_id:
+            raise HTTPException(status_code=400, detail="user_id and project_id required")
+
+        result = document_processor.process_ocr_document(
+            ocr_text=text,
+            user_id=user_id,
+            project_id=project_id,
+            document_id=document_id,
+            ocr_source="pymupdf",
+        )
+
+        chunks = _build_chunks_response(result, user_id, project_id, ocr_source="pymupdf")
+        logger.info(f"process-pymupdf done | {len(chunks)} chunks | {int((time.time()-start_time)*1000)}ms")
+        return JSONResponse(content=chunks)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"process-pymupdf error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# NEW: /process-mistral-ocr  — called by Cloudflare Worker (Mistral OCR 3)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/process-mistral-ocr",
+    status_code=status.HTTP_200_OK,
+    summary="Process Mistral OCR 3 structured response and return chunks",
+)
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def process_mistral_ocr(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    _: None = Depends(verify_api_key),
+) -> JSONResponse:
+    """
+    Accept a full Mistral OCR 3 response (pages array with structured markdown),
+    flatten + clean it, chunk it, and return structured chunks.
+
+    Embeddings are NOT included — the Worker generates them via Workers AI bge-m3.
+
+    Input:
+      {
+        ocr_response: { pages: [{ index, markdown, confidence_scores, ... }], ... },
+        document_id, user_id, project_id,
+        metadata: { document_name, mop_phase, module }
+      }
+    Output: ChunkResult[]
+    """
+    start_time = time.time()
+    try:
+        ocr_response = body.get("ocr_response", {})
+        document_id = body.get("document_id")
+        user_id = body.get("user_id", "")
+        project_id = body.get("project_id", "")
+
+        pages = ocr_response.get("pages", [])
+        if not pages:
+            raise HTTPException(status_code=400, detail="ocr_response.pages is empty")
+        if not user_id or not project_id:
+            raise HTTPException(status_code=400, detail="user_id and project_id required")
+
+        # ── Flatten OCR pages to a single markdown string ──────────
+        # Mistral OCR 3 returns rich markdown per page. We clean and merge.
+        page_markdowns: List[str] = []
+        page_confidences: List[float] = []
+        for page in pages:
+            md = page.get("markdown", "")
+            if not md or not md.strip():
+                continue
+            # Clean image references (no value for RAG embedding)
+            md = re.sub(r'!\[.*?\]\(.*?\)', '', md)
+            # Convert HTML tables to markdown tables if present
+            md = _html_tables_to_markdown(md)
+            # Simple LaTeX to text
+            md = re.sub(r'\$([^$]+)\$', r'\1', md)
+            page_markdowns.append(md.strip())
+            # Track confidence per page
+            cs = page.get("confidence_scores", {})
+            if cs:
+                page_confidences.append(cs.get("average_page_confidence_score", 0))
+
+        full_text = "\n\n".join(page_markdowns)
+        if len(full_text) < 50:
+            raise HTTPException(status_code=400, detail=f"OCR text too short after flatten ({len(full_text)} chars)")
+
+        avg_confidence = sum(page_confidences) / len(page_confidences) if page_confidences else None
+
+        result = document_processor.process_ocr_document(
+            ocr_text=full_text,
+            user_id=user_id,
+            project_id=project_id,
+            document_id=document_id,
+            ocr_source="mistral-ocr-3",
+            ocr_confidence=avg_confidence,
+        )
+
+        chunks = _build_chunks_response(
+            result, user_id, project_id,
+            ocr_source="mistral-ocr-3",
+            ocr_confidence=avg_confidence,
+        )
+        logger.info(
+            f"process-mistral-ocr done | {len(chunks)} chunks | "
+            f"pages: {len(pages)} | confidence: {avg_confidence:.1f}% | "
+            f"{int((time.time()-start_time)*1000)}ms"
+        )
+        return JSONResponse(content=chunks)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"process-mistral-ocr error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _html_tables_to_markdown(text: str) -> str:
+    """Convert simple HTML tables in text to markdown table format."""
+    import re as _re
+
+    def _convert_table(match):
+        html = match.group(0)
+        rows = _re.findall(r'<tr[^>]*>(.*?)</tr>', html, _re.DOTALL)
+        if not rows:
+            return html
+        md_rows = []
+        for i, row in enumerate(rows):
+            cells = _re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, _re.DOTALL)
+            cells = [c.strip() for c in cells]
+            md_rows.append("| " + " | ".join(cells) + " |")
+            if i == 0:
+                md_rows.append("|" + "|".join(["---"] * len(cells)) + "|")
+        return "\n".join(md_rows)
+
+    return _re.sub(r'<table[^>]*>.*?</table>', _convert_table, text, flags=_re.DOTALL)
 
 
 @router.get(
