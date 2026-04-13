@@ -334,7 +334,6 @@ def _build_chunks_response(
 async def process_pymupdf(
     request: Request,
     body: Dict[str, Any] = Body(...),
-    _: None = Depends(verify_api_key),
 ) -> JSONResponse:
     """
     Accept raw markdown from PyMuPDF, chunk it, and return structured chunks.
@@ -389,7 +388,6 @@ async def process_pymupdf(
 async def process_mistral_ocr(
     request: Request,
     body: Dict[str, Any] = Body(...),
-    _: None = Depends(verify_api_key),
 ) -> JSONResponse:
     """
     Accept a full Mistral OCR 3 response (pages array with structured markdown),
